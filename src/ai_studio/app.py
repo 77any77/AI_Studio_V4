@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import traceback
+from pathlib import Path
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -20,13 +22,22 @@ def configure_logging() -> None:
     )
 
 
+def _write_smoke_marker() -> None:
+    marker = os.getenv("AI_STUDIO_SMOKE_MARKER", "").strip()
+    if not marker:
+        return
+    Path(marker).write_text("startup-ok", encoding="utf-8")
+
+
 def main() -> int:
     configure_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("AI Studio V4")
+
     try:
         window = MainWindow()
         window.show()
+        _write_smoke_marker()
         return app.exec()
     except Exception:
         detail = traceback.format_exc()

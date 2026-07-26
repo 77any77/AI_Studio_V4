@@ -36,14 +36,40 @@ jobs:
       - name: Launch smoke test
         shell: powershell
         run: |
+          $marker = Join-Path $PWD "startup-ok.txt"
+          if (Test-Path $marker) { Remove-Item $marker -Force }
+
+          $env:AI_STUDIO_SMOKE_MARKER = $marker
           $process = Start-Process `
             -FilePath "dist\AI_Studio_V4\AI_Studio_V4.exe" `
             -PassThru
-          Start-Sleep -Seconds 8
-          if ($process.HasExited) {
-            throw "EXE exited during startup. Exit code: $($process.ExitCode)"
+
+          $started = $false
+          for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Seconds 1
+
+            if (Test-Path $marker) {
+              $started = $true
+              break
+            }
+
+            if ($process.HasExited) {
+              throw "EXE exited during startup. Exit code: $($process.ExitCode)"
+            }
           }
-          Stop-Process -Id $process.Id -Force
+
+          if (-not $started) {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+            throw "EXE did not create the startup marker."
+          }
+
+          if (-not $process.HasExited) {
+            Stop-Process -Id $process.Id -Force
+          }
+
+          Remove-Item $marker -Force -ErrorAction SilentlyContinue
 
       - name: Upload Windows application
         uses: actions/upload-artifact@v4

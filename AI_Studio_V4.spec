@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
-    ['src/ai_studio/__main__.py'],
+    ['launcher.py'],
     pathex=['src'],
     binaries=[],
     datas=[('assets', 'assets')],
@@ -12,7 +12,9 @@ a = Analysis(
     excludes=[],
     noarchive=False,
 )
+
 pyz = PYZ(a.pure)
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -25,6 +27,7 @@ exe = EXE(
     upx=True,
     console=False,
 )
+
 coll = COLLECT(
     exe,
     a.binaries,

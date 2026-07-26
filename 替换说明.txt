@@ -1,0 +1,20 @@
+AI Studio V4 启动修复补丁 v0.1.1
+
+错误原因：
+PyInstaller 直接运行 src/ai_studio/__main__.py 时，
+相对导入 from .app import main 失效。
+
+使用方法：
+1. 解压本补丁。
+2. Ctrl+A 复制补丁中的全部文件。
+3. 粘贴到本地 GitHub 仓库 AI_Studio_V4 根目录。
+4. Windows 询问时选择“替换目标中的文件”。
+5. 回到 GitHub Desktop。
+6. Summary 输入：Fix packaged app startup
+7. Commit to main。
+8. Push origin。
+9. 等 GitHub Actions 变成绿色。
+10. 下载最新的 AI-Studio-V4-Windows，完整解压后运行。
+
+本补丁同时改进了自动启动测试：
+只有软件主窗口真正创建成功，GitHub 构建才会通过。
