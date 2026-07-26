@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QThreadPool, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -16,38 +18,46 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QProgressBar,
     QSpinBox,
     QStackedWidget,
+    QStatusBar,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from ai_studio.core.paths import logs_dir
 from ai_studio.models.config import (
     APIProfile,
-    AppSettings,
     PROVIDER_PRESETS,
     TASK_LABELS,
 )
 from ai_studio.services.api_client import OpenAICompatibleClient
+from ai_studio.services.novel_pipeline import NovelPipeline, PipelineResult
+from ai_studio.services.router_service import APIRouterService
 from ai_studio.services.settings_service import SettingsService
+from ai_studio.ui.worker import Worker
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("AI Studio V4")
-        self.resize(1360, 860)
+        self.resize(1420, 900)
 
+        self.thread_pool = QThreadPool.globalInstance()
         self.settings_service = SettingsService()
         self.app_settings = self.settings_service.load()
         self.current_profile_id: str | None = None
         self._loading_profile = False
+        self.pipeline_result: PipelineResult | None = None
 
         self._build_ui()
         self._refresh_profile_list(select_first=True)
         self._refresh_route_combos()
         self._apply_style()
+        self.statusBar().showMessage("准备就绪")
 
     def _build_ui(self) -> None:
         container = QWidget()
@@ -57,12 +67,13 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
 
         self.nav = QListWidget()
-        self.nav.setFixedWidth(190)
+        self.nav.setFixedWidth(200)
         self.stack = QStackedWidget()
 
         pages = [
             ("项目首页", self._home_page()),
-            ("小说导入", self._novel_page()),
+            ("小说工作台", self._novel_page()),
+            ("分析结果", self._result_page()),
             ("API 中心", self._api_page()),
         ]
 
@@ -76,6 +87,14 @@ class MainWindow(QMainWindow):
         root.addWidget(self.nav)
         root.addWidget(self.stack, 1)
 
+        status = QStatusBar()
+        self.setStatusBar(status)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setFixedWidth(180)
+        self.progress.hide()
+        status.addPermanentWidget(self.progress)
+
     def _page(self, title: str) -> tuple[QWidget, QVBoxLayout]:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -88,8 +107,9 @@ class MainWindow(QMainWindow):
     def _home_page(self) -> QWidget:
         page, layout = self._page("项目首页")
         info = QLabel(
-            "AI Studio V4 多 API 路由版\n\n"
-            "每个推理任务都可以使用不同 API。"
+            "当前生产链路：\n\n"
+            "小说导入 → 故事分析 → 人物提取 → 场景提取 → 道具提取\n\n"
+            "每一步会自动使用“API中心 → 任务分流”中指定的接口。"
         )
         info.setWordWrap(True)
         info.setObjectName("infoCard")
@@ -98,22 +118,65 @@ class MainWindow(QMainWindow):
         return page
 
     def _novel_page(self) -> QWidget:
-        page, layout = self._page("小说导入")
-        row = QHBoxLayout()
-        button = QPushButton("导入 TXT")
-        button.clicked.connect(self._import_txt)
-        row.addWidget(button)
-        row.addStretch()
-        layout.addLayout(row)
+        page, layout = self._page("小说工作台")
+
+        toolbar = QHBoxLayout()
+        import_button = QPushButton("导入 TXT")
+        import_button.clicked.connect(self._import_txt)
+        clear_button = QPushButton("清空")
+        clear_button.clicked.connect(self._clear_novel)
+        analyze_button = QPushButton("开始完整分析")
+        analyze_button.clicked.connect(self._run_full_pipeline)
+
+        toolbar.addWidget(import_button)
+        toolbar.addWidget(clear_button)
+        toolbar.addWidget(analyze_button)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+
+        self.novel_stats = QLabel("字数：0")
+        layout.addWidget(self.novel_stats)
 
         self.novel_edit = QPlainTextEdit()
-        self.novel_edit.setPlaceholderText("粘贴小说正文或导入 TXT 文件")
+        self.novel_edit.setPlaceholderText(
+            "在这里粘贴小说正文，或点击“导入 TXT”。\n"
+            "完成后点击“开始完整分析”。"
+        )
+        self.novel_edit.textChanged.connect(self._update_novel_stats)
         layout.addWidget(self.novel_edit, 1)
+        return page
+
+    def _result_page(self) -> QWidget:
+        page, layout = self._page("分析结果")
+
+        self.result_tabs = QTabWidget()
+
+        self.analysis_view = QPlainTextEdit()
+        self.characters_view = QPlainTextEdit()
+        self.scenes_view = QPlainTextEdit()
+        self.props_view = QPlainTextEdit()
+        self.raw_view = QPlainTextEdit()
+
+        for widget in (
+            self.analysis_view,
+            self.characters_view,
+            self.scenes_view,
+            self.props_view,
+            self.raw_view,
+        ):
+            widget.setReadOnly(True)
+
+        self.result_tabs.addTab(self.analysis_view, "故事分析")
+        self.result_tabs.addTab(self.characters_view, "人物资产")
+        self.result_tabs.addTab(self.scenes_view, "场景资产")
+        self.result_tabs.addTab(self.props_view, "道具资产")
+        self.result_tabs.addTab(self.raw_view, "原始结果")
+
+        layout.addWidget(self.result_tabs, 1)
         return page
 
     def _api_page(self) -> QWidget:
         page, layout = self._page("多 API 管理与任务路由")
-
         tabs = QTabWidget()
         tabs.addTab(self._profiles_tab(), "接口配置")
         tabs.addTab(self._routes_tab(), "任务分流")
@@ -155,7 +218,6 @@ class MainWindow(QMainWindow):
         self.provider_combo.currentTextChanged.connect(
             self._provider_changed
         )
-
         self.base_url_edit = QLineEdit()
         self.api_key_edit = QLineEdit()
         self.api_key_edit.setEchoMode(QLineEdit.Password)
@@ -192,20 +254,10 @@ class MainWindow(QMainWindow):
         action_row.addWidget(test_button)
         action_row.addStretch()
         right.addLayout(action_row)
-
-        note = QLabel(
-            "说明：可以建立多个接口配置。"
-            "例如 DeepSeek 用于故事分析，OpenAI 用于导演分镜，"
-            "Ollama 用于本地批量任务。"
-        )
-        note.setWordWrap(True)
-        note.setObjectName("infoCard")
-        right.addWidget(note)
         right.addStretch()
 
         right_box = QWidget()
         right_box.setLayout(right)
-
         root.addWidget(left_box)
         root.addWidget(right_box, 1)
         return tab
@@ -216,7 +268,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(18, 18, 18, 18)
 
         intro = QLabel(
-            "为每个推理任务指定 API。后续各引擎会自动按这里的规则调用。"
+            "故事分析、人物、场景、道具可以分别使用不同接口。"
         )
         intro.setWordWrap(True)
         intro.setObjectName("infoCard")
@@ -235,6 +287,114 @@ class MainWindow(QMainWindow):
         layout.addWidget(save_button, alignment=Qt.AlignLeft)
         layout.addStretch()
         return tab
+
+    def _run_full_pipeline(self) -> None:
+        novel = self.novel_edit.toPlainText().strip()
+        if not novel:
+            QMessageBox.warning(
+                self,
+                "缺少小说",
+                "请先导入或粘贴小说正文。",
+            )
+            return
+
+        self.app_settings = self.settings_service.load()
+        pipeline = NovelPipeline(APIRouterService(self.app_settings))
+        worker = Worker(lambda: pipeline.run_all(novel))
+        worker.signals.result.connect(self._pipeline_finished)
+        worker.signals.error.connect(self._pipeline_failed)
+        worker.signals.finished.connect(self._pipeline_stopped)
+
+        self._set_busy(True, "正在进行故事分析与资产提取……")
+        self.thread_pool.start(worker)
+
+    def _pipeline_finished(self, result: PipelineResult) -> None:
+        self.pipeline_result = result
+        self.analysis_view.setPlainText(
+            json.dumps(result.analysis, ensure_ascii=False, indent=2)
+        )
+        self.characters_view.setPlainText(
+            json.dumps(result.characters, ensure_ascii=False, indent=2)
+        )
+        self.scenes_view.setPlainText(
+            json.dumps(result.scenes, ensure_ascii=False, indent=2)
+        )
+        self.props_view.setPlainText(
+            json.dumps(result.props, ensure_ascii=False, indent=2)
+        )
+        self.raw_view.setPlainText(
+            json.dumps(result.raw_results, ensure_ascii=False, indent=2)
+        )
+        self.nav.setCurrentRow(2)
+        QMessageBox.information(
+            self,
+            "分析完成",
+            f"已提取：\n"
+            f"人物 {len(result.characters)} 个\n"
+            f"场景 {len(result.scenes)} 个\n"
+            f"道具 {len(result.props)} 个",
+        )
+
+    def _pipeline_failed(self, details: str) -> None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = logs_dir() / f"pipeline_{timestamp}.log"
+        path.write_text(details, encoding="utf-8")
+        last_line = (
+            details.strip().splitlines()[-1]
+            if details.strip()
+            else "未知错误"
+        )
+        QMessageBox.critical(
+            self,
+            "分析失败",
+            f"{last_line}\n\n详细日志：\n{path}",
+        )
+
+    def _pipeline_stopped(self) -> None:
+        self._set_busy(False, "操作完成")
+
+    def _set_busy(self, busy: bool, message: str) -> None:
+        self.progress.setVisible(busy)
+        self.nav.setEnabled(not busy)
+        self.statusBar().showMessage(message)
+
+    def _update_novel_stats(self) -> None:
+        text = self.novel_edit.toPlainText()
+        non_space = len("".join(text.split()))
+        self.novel_stats.setText(
+            f"字符：{len(text):,}　非空字符：{non_space:,}"
+        )
+
+    def _clear_novel(self) -> None:
+        self.novel_edit.clear()
+
+    def _import_txt(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入小说",
+            "",
+            "文本文件 (*.txt);;所有文件 (*.*)",
+        )
+        if not filename:
+            return
+
+        raw = Path(filename).read_bytes()
+        for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
+            try:
+                self.novel_edit.setPlainText(raw.decode(encoding))
+                self.statusBar().showMessage(
+                    f"已导入：{filename}",
+                    5000,
+                )
+                return
+            except UnicodeDecodeError:
+                continue
+
+        QMessageBox.warning(
+            self,
+            "导入失败",
+            "无法识别文本编码。",
+        )
 
     def _refresh_profile_list(self, select_first: bool = False) -> None:
         selected_id = self.current_profile_id
@@ -256,10 +416,8 @@ class MainWindow(QMainWindow):
                     target_row = index
                     break
 
-        if self.app_settings.profiles and (select_first or selected_id):
+        if self.app_settings.profiles:
             self.profile_list.setCurrentRow(target_row)
-        elif self.app_settings.profiles:
-            self.profile_list.setCurrentRow(0)
 
     def _profile_selection_changed(self, row: int) -> None:
         if row < 0 or row >= len(self.app_settings.profiles):
@@ -285,10 +443,9 @@ class MainWindow(QMainWindow):
         if self._loading_profile:
             return
         preset = PROVIDER_PRESETS.get(provider)
-        if not preset:
-            return
-        self.base_url_edit.setText(preset["base_url"])
-        self.model_edit.setText(preset["model"])
+        if preset:
+            self.base_url_edit.setText(preset["base_url"])
+            self.model_edit.setText(preset["model"])
 
     def _toggle_key_visibility(self, checked: bool) -> None:
         self.api_key_edit.setEchoMode(
@@ -296,8 +453,9 @@ class MainWindow(QMainWindow):
         )
 
     def _add_profile(self) -> None:
-        number = len(self.app_settings.profiles) + 1
-        profile = APIProfile(name=f"接口 {number}")
+        profile = APIProfile(
+            name=f"接口 {len(self.app_settings.profiles) + 1}"
+        )
         self.app_settings.profiles.append(profile)
         self.current_profile_id = profile.profile_id
         self._refresh_profile_list()
@@ -311,17 +469,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "无法删除",
-                "至少需要保留一个 API 接口配置。",
+                "至少需要保留一个接口。",
             )
             return
 
         profile = self.app_settings.profiles[row]
-        answer = QMessageBox.question(
+        if QMessageBox.question(
             self,
             "删除接口",
             f"确定删除“{profile.name}”吗？",
-        )
-        if answer != QMessageBox.Yes:
+        ) != QMessageBox.Yes:
             return
 
         self.app_settings.profiles.pop(row)
@@ -397,18 +554,17 @@ class MainWindow(QMainWindow):
             ]
 
         for task_key, combo in getattr(
-            self, "route_combos", {}
+            self,
+            "route_combos",
+            {},
         ).items():
             current_id = self.app_settings.task_routes.get(task_key, "")
             combo.blockSignals(True)
             combo.clear()
             for name, profile_id in profile_items:
                 combo.addItem(name, profile_id)
-
-            selected_index = combo.findData(current_id)
-            combo.setCurrentIndex(
-                selected_index if selected_index >= 0 else 0
-            )
+            index = combo.findData(current_id)
+            combo.setCurrentIndex(index if index >= 0 else 0)
             combo.blockSignals(False)
 
     def _save_routes(self) -> None:
@@ -421,31 +577,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "保存成功",
-            "所有任务的 API 路由已保存。",
-        )
-
-    def _import_txt(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "导入小说",
-            "",
-            "文本文件 (*.txt)",
-        )
-        if not filename:
-            return
-
-        raw = Path(filename).read_bytes()
-        for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
-            try:
-                self.novel_edit.setPlainText(raw.decode(encoding))
-                return
-            except UnicodeDecodeError:
-                continue
-
-        QMessageBox.warning(
-            self,
-            "导入失败",
-            "无法识别文本编码。",
+            "任务 API 路由已保存。",
         )
 
     def _apply_style(self) -> None:
