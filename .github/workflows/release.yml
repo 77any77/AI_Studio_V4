@@ -1,0 +1,61 @@
+name: Build and Release Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，例如 0.6.0"
+        required: true
+        default: "0.6.0"
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+          pip install pyinstaller PySide6 pytest
+      - name: Run tests
+        run: pytest -q
+      - name: Build main application
+        shell: pwsh
+        run: |
+          if (Test-Path AI_Studio_V4.spec) {
+            pyinstaller --noconfirm --clean AI_Studio_V4.spec
+          } elseif (Test-Path app.spec) {
+            pyinstaller --noconfirm --clean app.spec
+          } else {
+            Write-Error "没有找到主程序 spec 文件。"
+          }
+      - name: Build updater
+        shell: pwsh
+        working-directory: updater
+        run: pyinstaller --noconfirm --clean "AI_Studio_Updater.spec"
+      - name: Package update
+        shell: pwsh
+        run: |
+          $appDir = Get-ChildItem dist -Directory | Select-Object -First 1
+          $updater = Get-ChildItem updater/dist -Recurse -Filter "*.exe" | Select-Object -First 1
+          Copy-Item $updater.FullName (Join-Path $appDir.FullName "AI Studio Updater.exe") -Force
+          $version = "${{ github.event.inputs.version }}"
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = "${{ github.ref_name }}".TrimStart("v") }
+          Compress-Archive -Path "$($appDir.FullName)\*" -DestinationPath "AI-Studio-V4-Update-v$version.zip" -Force
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', github.event.inputs.version) }}
+          name: AI Studio V4 ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', github.event.inputs.version) }}
+          generate_release_notes: true
+          files: AI-Studio-V4-Update-*.zip
