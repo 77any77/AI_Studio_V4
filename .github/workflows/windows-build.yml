@@ -1,0 +1,53 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+
+      - name: Run unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest
+
+      - name: Build EXE
+        run: pyinstaller --noconfirm --clean AI_Studio_V4.spec
+
+      - name: Launch smoke test
+        shell: powershell
+        run: |
+          $process = Start-Process `
+            -FilePath "dist\AI_Studio_V4\AI_Studio_V4.exe" `
+            -PassThru
+          Start-Sleep -Seconds 8
+          if ($process.HasExited) {
+            throw "EXE exited during startup. Exit code: $($process.ExitCode)"
+          }
+          Stop-Process -Id $process.Id -Force
+
+      - name: Upload Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Studio-V4-Windows
+          path: dist/AI_Studio_V4/
+          if-no-files-found: error
