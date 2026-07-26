@@ -34,6 +34,11 @@ from ai_studio.models.config import (
     TASK_LABELS,
 )
 from ai_studio.services.api_client import OpenAICompatibleClient
+from ai_studio.services.director_engine import (
+    DirectorEngine,
+    PromptCompileResult,
+    StoryboardResult,
+)
 from ai_studio.services.novel_pipeline import NovelPipeline, PipelineResult
 from ai_studio.services.router_service import APIRouterService
 from ai_studio.services.settings_service import SettingsService
@@ -44,14 +49,17 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("AI Studio V4")
-        self.resize(1420, 900)
+        self.resize(1460, 920)
 
         self.thread_pool = QThreadPool.globalInstance()
         self.settings_service = SettingsService()
         self.app_settings = self.settings_service.load()
         self.current_profile_id: str | None = None
         self._loading_profile = False
+
         self.pipeline_result: PipelineResult | None = None
+        self.storyboard_result: StoryboardResult | None = None
+        self.prompt_result: PromptCompileResult | None = None
 
         self._build_ui()
         self._refresh_profile_list(select_first=True)
@@ -67,13 +75,15 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
 
         self.nav = QListWidget()
-        self.nav.setFixedWidth(200)
+        self.nav.setFixedWidth(205)
         self.stack = QStackedWidget()
 
         pages = [
             ("项目首页", self._home_page()),
             ("小说工作台", self._novel_page()),
-            ("分析结果", self._result_page()),
+            ("资产分析", self._result_page()),
+            ("导演分镜", self._storyboard_page()),
+            ("视频 Prompt", self._prompt_page()),
             ("API 中心", self._api_page()),
         ]
 
@@ -91,7 +101,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
-        self.progress.setFixedWidth(180)
+        self.progress.setFixedWidth(190)
         self.progress.hide()
         status.addPermanentWidget(self.progress)
 
@@ -108,8 +118,9 @@ class MainWindow(QMainWindow):
         page, layout = self._page("项目首页")
         info = QLabel(
             "当前生产链路：\n\n"
-            "小说导入 → 故事分析 → 人物提取 → 场景提取 → 道具提取\n\n"
-            "每一步会自动使用“API中心 → 任务分流”中指定的接口。"
+            "小说导入 → 故事分析 → 人物/场景/道具资产 → "
+            "导演分镜 → Seedance视频Prompt\n\n"
+            "各模块可以使用不同API。"
         )
         info.setWordWrap(True)
         info.setObjectName("infoCard")
@@ -134,46 +145,88 @@ class MainWindow(QMainWindow):
         toolbar.addStretch()
         layout.addLayout(toolbar)
 
-        self.novel_stats = QLabel("字数：0")
+        self.novel_stats = QLabel("字符：0")
         layout.addWidget(self.novel_stats)
 
         self.novel_edit = QPlainTextEdit()
         self.novel_edit.setPlaceholderText(
-            "在这里粘贴小说正文，或点击“导入 TXT”。\n"
-            "完成后点击“开始完整分析”。"
+            "导入或粘贴小说正文，然后点击“开始完整分析”。"
         )
         self.novel_edit.textChanged.connect(self._update_novel_stats)
         layout.addWidget(self.novel_edit, 1)
         return page
 
     def _result_page(self) -> QWidget:
-        page, layout = self._page("分析结果")
+        page, layout = self._page("故事与资产分析")
 
         self.result_tabs = QTabWidget()
-
-        self.analysis_view = QPlainTextEdit()
-        self.characters_view = QPlainTextEdit()
-        self.scenes_view = QPlainTextEdit()
-        self.props_view = QPlainTextEdit()
-        self.raw_view = QPlainTextEdit()
-
-        for widget in (
-            self.analysis_view,
-            self.characters_view,
-            self.scenes_view,
-            self.props_view,
-            self.raw_view,
-        ):
-            widget.setReadOnly(True)
+        self.analysis_view = self._readonly_editor()
+        self.characters_view = self._readonly_editor()
+        self.scenes_view = self._readonly_editor()
+        self.props_view = self._readonly_editor()
+        self.raw_view = self._readonly_editor()
 
         self.result_tabs.addTab(self.analysis_view, "故事分析")
         self.result_tabs.addTab(self.characters_view, "人物资产")
         self.result_tabs.addTab(self.scenes_view, "场景资产")
         self.result_tabs.addTab(self.props_view, "道具资产")
         self.result_tabs.addTab(self.raw_view, "原始结果")
-
         layout.addWidget(self.result_tabs, 1)
         return page
+
+    def _storyboard_page(self) -> QWidget:
+        page, layout = self._page("Director Engine · 自动导演分镜")
+
+        toolbar = QHBoxLayout()
+        generate_button = QPushButton("生成导演分镜")
+        generate_button.clicked.connect(self._run_storyboard)
+        export_button = QPushButton("导出分镜 JSON")
+        export_button.clicked.connect(self._export_storyboard)
+        toolbar.addWidget(generate_button)
+        toolbar.addWidget(export_button)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+
+        self.storyboard_summary = QLabel(
+            "尚未生成分镜。请先完成小说资产分析。"
+        )
+        self.storyboard_summary.setObjectName("infoCard")
+        layout.addWidget(self.storyboard_summary)
+
+        self.storyboard_view = self._readonly_editor()
+        layout.addWidget(self.storyboard_view, 1)
+        return page
+
+    def _prompt_page(self) -> QWidget:
+        page, layout = self._page("视频 Prompt 编译器")
+
+        toolbar = QHBoxLayout()
+        compile_button = QPushButton("编译 Seedance Prompt")
+        compile_button.clicked.connect(self._run_prompt_compile)
+        export_json = QPushButton("导出 Prompt JSON")
+        export_json.clicked.connect(self._export_prompts_json)
+        export_text = QPushButton("导出 Prompt TXT")
+        export_text.clicked.connect(self._export_prompts_text)
+        toolbar.addWidget(compile_button)
+        toolbar.addWidget(export_json)
+        toolbar.addWidget(export_text)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+
+        self.prompt_summary = QLabel(
+            "尚未编译视频Prompt。请先生成导演分镜。"
+        )
+        self.prompt_summary.setObjectName("infoCard")
+        layout.addWidget(self.prompt_summary)
+
+        self.prompt_view = self._readonly_editor()
+        layout.addWidget(self.prompt_view, 1)
+        return page
+
+    def _readonly_editor(self) -> QPlainTextEdit:
+        editor = QPlainTextEdit()
+        editor.setReadOnly(True)
+        return editor
 
     def _api_page(self) -> QWidget:
         page, layout = self._page("多 API 管理与任务路由")
@@ -268,7 +321,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(18, 18, 18, 18)
 
         intro = QLabel(
-            "故事分析、人物、场景、道具可以分别使用不同接口。"
+            "导演分镜和视频Prompt可以指定不同模型。"
         )
         intro.setWordWrap(True)
         intro.setObjectName("infoCard")
@@ -292,24 +345,23 @@ class MainWindow(QMainWindow):
         novel = self.novel_edit.toPlainText().strip()
         if not novel:
             QMessageBox.warning(
-                self,
-                "缺少小说",
-                "请先导入或粘贴小说正文。",
+                self, "缺少小说", "请先导入或粘贴小说正文。"
             )
             return
 
         self.app_settings = self.settings_service.load()
         pipeline = NovelPipeline(APIRouterService(self.app_settings))
-        worker = Worker(lambda: pipeline.run_all(novel))
-        worker.signals.result.connect(self._pipeline_finished)
-        worker.signals.error.connect(self._pipeline_failed)
-        worker.signals.finished.connect(self._pipeline_stopped)
-
-        self._set_busy(True, "正在进行故事分析与资产提取……")
-        self.thread_pool.start(worker)
+        self._start_worker(
+            lambda: pipeline.run_all(novel),
+            self._pipeline_finished,
+            "正在进行故事分析与资产提取……",
+        )
 
     def _pipeline_finished(self, result: PipelineResult) -> None:
         self.pipeline_result = result
+        self.storyboard_result = None
+        self.prompt_result = None
+
         self.analysis_view.setPlainText(
             json.dumps(result.analysis, ensure_ascii=False, indent=2)
         )
@@ -325,20 +377,156 @@ class MainWindow(QMainWindow):
         self.raw_view.setPlainText(
             json.dumps(result.raw_results, ensure_ascii=False, indent=2)
         )
+        self.storyboard_view.clear()
+        self.prompt_view.clear()
+        self.storyboard_summary.setText(
+            "资产分析已完成，可以生成导演分镜。"
+        )
+        self.prompt_summary.setText(
+            "请先生成导演分镜。"
+        )
         self.nav.setCurrentRow(2)
+
         QMessageBox.information(
             self,
             "分析完成",
-            f"已提取：\n"
             f"人物 {len(result.characters)} 个\n"
             f"场景 {len(result.scenes)} 个\n"
             f"道具 {len(result.props)} 个",
         )
 
-    def _pipeline_failed(self, details: str) -> None:
+    def _run_storyboard(self) -> None:
+        if self.pipeline_result is None:
+            QMessageBox.warning(
+                self,
+                "缺少资产",
+                "请先完成小说的故事与资产分析。",
+            )
+            return
+
+        novel = self.novel_edit.toPlainText().strip()
+        router = APIRouterService(self.settings_service.load())
+        engine = DirectorEngine(router)
+        result = self.pipeline_result
+
+        self._start_worker(
+            lambda: engine.create_storyboard(
+                novel=novel,
+                analysis=result.analysis,
+                characters=result.characters,
+                scenes=result.scenes,
+                props=result.props,
+            ),
+            self._storyboard_finished,
+            "Director Engine 正在生成分镜……",
+        )
+
+    def _storyboard_finished(
+        self,
+        result: StoryboardResult,
+    ) -> None:
+        self.storyboard_result = result
+        self.prompt_result = None
+
+        display = {
+            "episode_title": result.episode_title,
+            "total_duration": result.total_duration,
+            "shots": result.shots,
+        }
+        self.storyboard_view.setPlainText(
+            json.dumps(display, ensure_ascii=False, indent=2)
+        )
+        self.storyboard_summary.setText(
+            f"标题：{result.episode_title}　"
+            f"镜头：{len(result.shots)} 个　"
+            f"总时长：{result.total_duration} 秒"
+        )
+        self.prompt_summary.setText(
+            "导演分镜已生成，可以编译视频Prompt。"
+        )
+        self.nav.setCurrentRow(3)
+
+        QMessageBox.information(
+            self,
+            "分镜完成",
+            f"共生成 {len(result.shots)} 个镜头，"
+            f"总时长 {result.total_duration} 秒。",
+        )
+
+    def _run_prompt_compile(self) -> None:
+        if self.storyboard_result is None:
+            QMessageBox.warning(
+                self,
+                "缺少分镜",
+                "请先生成导演分镜。",
+            )
+            return
+        if self.pipeline_result is None:
+            QMessageBox.warning(
+                self,
+                "缺少资产",
+                "人物、场景和道具资产不存在。",
+            )
+            return
+
+        router = APIRouterService(self.settings_service.load())
+        engine = DirectorEngine(router)
+        assets = self.pipeline_result
+        storyboard = self.storyboard_result
+
+        self._start_worker(
+            lambda: engine.compile_video_prompts(
+                storyboard=storyboard,
+                characters=assets.characters,
+                scenes=assets.scenes,
+                props=assets.props,
+            ),
+            self._prompt_finished,
+            "正在编译 Seedance 视频 Prompt……",
+        )
+
+    def _prompt_finished(
+        self,
+        result: PromptCompileResult,
+    ) -> None:
+        self.prompt_result = result
+        self.prompt_view.setPlainText(
+            json.dumps(
+                {"prompts": result.prompts},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        self.prompt_summary.setText(
+            f"已编译 {len(result.prompts)} 条视频Prompt。"
+        )
+        self.nav.setCurrentRow(4)
+
+        QMessageBox.information(
+            self,
+            "编译完成",
+            f"已生成 {len(result.prompts)} 条视频Prompt。",
+        )
+
+    def _start_worker(
+        self,
+        function,
+        on_result,
+        message: str,
+    ) -> None:
+        worker = Worker(function)
+        worker.signals.result.connect(on_result)
+        worker.signals.error.connect(self._operation_failed)
+        worker.signals.finished.connect(self._operation_stopped)
+
+        self._set_busy(True, message)
+        self.thread_pool.start(worker)
+
+    def _operation_failed(self, details: str) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = logs_dir() / f"pipeline_{timestamp}.log"
+        path = logs_dir() / f"operation_{timestamp}.log"
         path.write_text(details, encoding="utf-8")
+
         last_line = (
             details.strip().splitlines()[-1]
             if details.strip()
@@ -346,17 +534,111 @@ class MainWindow(QMainWindow):
         )
         QMessageBox.critical(
             self,
-            "分析失败",
+            "操作失败",
             f"{last_line}\n\n详细日志：\n{path}",
         )
 
-    def _pipeline_stopped(self) -> None:
+    def _operation_stopped(self) -> None:
         self._set_busy(False, "操作完成")
 
     def _set_busy(self, busy: bool, message: str) -> None:
         self.progress.setVisible(busy)
         self.nav.setEnabled(not busy)
         self.statusBar().showMessage(message)
+
+    def _export_storyboard(self) -> None:
+        if self.storyboard_result is None:
+            QMessageBox.warning(
+                self, "没有内容", "当前没有可导出的分镜。"
+            )
+            return
+
+        default_name = (
+            f"{self.storyboard_result.episode_title}_导演分镜.json"
+        )
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出导演分镜",
+            default_name,
+            "JSON文件 (*.json)",
+        )
+        if not filename:
+            return
+
+        data = {
+            "episode_title": self.storyboard_result.episode_title,
+            "total_duration": self.storyboard_result.total_duration,
+            "shots": self.storyboard_result.shots,
+        }
+        Path(filename).write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        QMessageBox.information(
+            self, "导出完成", f"已保存到：\n{filename}"
+        )
+
+    def _export_prompts_json(self) -> None:
+        if self.prompt_result is None:
+            QMessageBox.warning(
+                self, "没有内容", "当前没有可导出的Prompt。"
+            )
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出视频Prompt",
+            "Seedance_Prompts.json",
+            "JSON文件 (*.json)",
+        )
+        if not filename:
+            return
+
+        Path(filename).write_text(
+            json.dumps(
+                {"prompts": self.prompt_result.prompts},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        QMessageBox.information(
+            self, "导出完成", f"已保存到：\n{filename}"
+        )
+
+    def _export_prompts_text(self) -> None:
+        if self.prompt_result is None:
+            QMessageBox.warning(
+                self, "没有内容", "当前没有可导出的Prompt。"
+            )
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出视频Prompt",
+            "Seedance_Prompts.txt",
+            "文本文件 (*.txt)",
+        )
+        if not filename:
+            return
+
+        blocks = []
+        for item in self.prompt_result.prompts:
+            blocks.append(
+                f"【{item.get('shot_id', '')}】"
+                f" 时长：{item.get('duration', '')}秒\n"
+                f"{item.get('prompt', '')}\n"
+                f"负面约束：{item.get('negative_prompt', '')}\n"
+                f"连续性：{item.get('continuity_reference', '')}\n"
+            )
+
+        Path(filename).write_text(
+            "\n".join(blocks),
+            encoding="utf-8",
+        )
+        QMessageBox.information(
+            self, "导出完成", f"已保存到：\n{filename}"
+        )
 
     def _update_novel_stats(self) -> None:
         text = self.novel_edit.toPlainText()
@@ -383,20 +665,20 @@ class MainWindow(QMainWindow):
             try:
                 self.novel_edit.setPlainText(raw.decode(encoding))
                 self.statusBar().showMessage(
-                    f"已导入：{filename}",
-                    5000,
+                    f"已导入：{filename}", 5000
                 )
                 return
             except UnicodeDecodeError:
                 continue
 
         QMessageBox.warning(
-            self,
-            "导入失败",
-            "无法识别文本编码。",
+            self, "导入失败", "无法识别文本编码。"
         )
 
-    def _refresh_profile_list(self, select_first: bool = False) -> None:
+    def _refresh_profile_list(
+        self,
+        select_first: bool = False,
+    ) -> None:
         selected_id = self.current_profile_id
         self.profile_list.blockSignals(True)
         self.profile_list.clear()
@@ -411,7 +693,9 @@ class MainWindow(QMainWindow):
 
         target_row = 0
         if selected_id:
-            for index, profile in enumerate(self.app_settings.profiles):
+            for index, profile in enumerate(
+                self.app_settings.profiles
+            ):
                 if profile.profile_id == selected_id:
                     target_row = index
                     break
@@ -467,9 +751,7 @@ class MainWindow(QMainWindow):
             return
         if len(self.app_settings.profiles) <= 1:
             QMessageBox.warning(
-                self,
-                "无法删除",
-                "至少需要保留一个接口。",
+                self, "无法删除", "至少需要保留一个接口。"
             )
             return
 
@@ -509,7 +791,9 @@ class MainWindow(QMainWindow):
 
     def _save_current_profile(self) -> None:
         profile = self._current_profile_from_form()
-        for index, existing in enumerate(self.app_settings.profiles):
+        for index, existing in enumerate(
+            self.app_settings.profiles
+        ):
             if existing.profile_id == profile.profile_id:
                 self.app_settings.profiles[index] = profile
                 break
@@ -529,7 +813,9 @@ class MainWindow(QMainWindow):
     def _test_current_profile(self) -> None:
         profile = self._current_profile_from_form()
         try:
-            result = OpenAICompatibleClient(profile).test_connection()
+            result = OpenAICompatibleClient(
+                profile
+            ).test_connection()
             QMessageBox.information(
                 self,
                 "连接成功",
@@ -539,7 +825,9 @@ class MainWindow(QMainWindow):
                 f"返回：{result.text}",
             )
         except Exception as exc:
-            QMessageBox.critical(self, "连接失败", str(exc))
+            QMessageBox.critical(
+                self, "连接失败", str(exc)
+            )
 
     def _refresh_route_combos(self) -> None:
         profile_items = [
@@ -554,15 +842,17 @@ class MainWindow(QMainWindow):
             ]
 
         for task_key, combo in getattr(
-            self,
-            "route_combos",
-            {},
+            self, "route_combos", {}
         ).items():
-            current_id = self.app_settings.task_routes.get(task_key, "")
+            current_id = self.app_settings.task_routes.get(
+                task_key, ""
+            )
             combo.blockSignals(True)
             combo.clear()
+
             for name, profile_id in profile_items:
                 combo.addItem(name, profile_id)
+
             index = combo.findData(current_id)
             combo.setCurrentIndex(index if index >= 0 else 0)
             combo.blockSignals(False)
@@ -571,13 +861,13 @@ class MainWindow(QMainWindow):
         for task_key, combo in self.route_combos.items():
             profile_id = combo.currentData()
             if profile_id:
-                self.app_settings.task_routes[task_key] = str(profile_id)
+                self.app_settings.task_routes[task_key] = str(
+                    profile_id
+                )
 
         self.settings_service.save(self.app_settings)
         QMessageBox.information(
-            self,
-            "保存成功",
-            "任务 API 路由已保存。",
+            self, "保存成功", "任务API路由已保存。"
         )
 
     def _apply_style(self) -> None:
