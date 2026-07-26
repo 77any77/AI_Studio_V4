@@ -76,6 +76,11 @@ class APIProfile:
         )
 
 
+# 兼容旧版模块和旧测试。
+# 新代码应优先使用 APIProfile。
+APISettings = APIProfile
+
+
 @dataclass(slots=True)
 class AppSettings:
     profiles: list[APIProfile] = field(default_factory=list)
@@ -99,7 +104,6 @@ class AppSettings:
     def from_dict(cls, value: dict | None) -> "AppSettings":
         value = value or {}
 
-        # 兼容旧版单接口配置
         if "profiles" not in value and any(
             key in value for key in ("provider", "base_url", "model", "api_key")
         ):
